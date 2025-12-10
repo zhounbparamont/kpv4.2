@@ -495,37 +495,41 @@ export default function WarehouseActionPage() {
                 )
               )}
 
-              {/* 附件列表 */}
-              {modal.fileList?.length > 0 && (
-                <div className="mt-3">
-                  <p className="font-semibold">附件：</p>
+ {/* 附件列表 */}
+{modal.fileList?.length > 0 && (
+  <div className="mt-3">
+    <p className="font-semibold">附件：</p>
 
-                  <ul className="list-disc ml-6 text-xs space-y-1">
-                    {modal.fileList.map((f, i) => (
-                      <li key={i} className="flex items-center gap-2">
-                        <a
-                          href={f.url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-blue-600 hover:underline"
-                        >
-                          {f.name}
-                        </a>
+    <ul className="list-disc ml-6 text-xs space-y-1">
+      {modal.fileList.map((f, i) => (
+        <li key={i} className="flex items-center gap-2">
+          <a
+            href={f.url.replace(/^http:\/\//, "https://")}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-blue-600 hover:underline"
+          >
+            {f.name}
+          </a>
 
-                        {(f.name.toLowerCase().endsWith(".xls") ||
-                          f.name.toLowerCase().endsWith(".xlsx")) && (
-                          <button
-                            className="px-2 py-0.5 bg-blue-600 text-white rounded text-xs"
-                            onClick={() => handleDataExtract(f.url)}
-                          >
-                            数据提取
-                          </button>
-                        )}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
+          {(f.name.toLowerCase().endsWith(".xls") ||
+            f.name.toLowerCase().endsWith(".xlsx")) && (
+            <button
+              className="px-2 py-0.5 bg-blue-600 text-white rounded text-xs"
+              onClick={() => {
+                const proxyUrl = `/api/proxy?url=${encodeURIComponent(f.url)}`;
+                handleDataExtract(proxyUrl);
+              }}
+            >
+              数据提取
+            </button>
+          )}
+        </li>
+      ))}
+    </ul>
+  </div>
+)}
+
 
               {/* 提取进度条 */}
               {loading && (
