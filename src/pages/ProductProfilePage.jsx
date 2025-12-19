@@ -121,19 +121,25 @@ const calculateProfit = (item) => {
   const realTimeCost = (Number(item.purchaseCost) || 0) * cur.rate;
   const first = Number(item.firstCost) || 0;
   const last = Number(item.lastCost) || 0;
-  const adFee = ((Number(item.adCost) || 0) / 100) * sale;
-  const storageFee = ((Number(item.storageCost) || 0) / 100) * sale;
-  const returnFee = ((Number(item.returnCost) || 0) / 100) * sale;
 
-  // VAT：税款金额 = sale * vatRate（显示用）
+  // VAT：税款金额 = netSale * vatRate（显示用）
   const vatRate = VAT_RATE_MAP[item.country] || 0;
-  const vatFee = sale * vatRate;
-
-  // 净售价 = sale * (1 - vatRate)（实际收入）
-  const netSale = sale * (1 - vatRate);
+  let netSale, vatFee;
+  if (vatRate > 0) {
+    netSale = sale / (1 + vatRate);
+    vatFee = netSale * vatRate;
+  } else {
+    netSale = sale;
+    vatFee = 0;
+  }
 
   // 佣金 = sale * COMMISSION_RATE（基于含 VAT 售价）
   const commissionFee = sale * COMMISSION_RATE;
+
+  // 广告/仓储/退款：基于净售价
+  const adFee = ((Number(item.adCost) || 0) / 100) * netSale;
+  const storageFee = ((Number(item.storageCost) || 0) / 100) * netSale;
+  const returnFee = ((Number(item.returnCost) || 0) / 100) * netSale;
 
   // 总成本（不含 VAT 和佣金）
   const totalCost = realTimeCost + first + last + adFee + storageFee + returnFee;
