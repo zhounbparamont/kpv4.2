@@ -124,14 +124,13 @@ const calculateProfit = (item) => {
 
   // VAT：税款金额 = netSale * vatRate（显示用）
   const vatRate = VAT_RATE_MAP[item.country] || 0;
-  let netSale, vatFee;
+  let netSale;
   if (vatRate > 0) {
     netSale = sale / (1 + vatRate);
-    vatFee = netSale * vatRate;
   } else {
     netSale = sale;
-    vatFee = 0;
   }
+  const vatFee = sale - netSale;
 
   // 佣金 = sale * COMMISSION_RATE（基于含 VAT 售价）
   const commissionFee = sale * COMMISSION_RATE;
