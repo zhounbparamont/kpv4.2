@@ -110,6 +110,43 @@ const safeSave = async (obj, errorContext = "Save operation") => {
   }
 };
 
+// ✅ 利润计算函数（复用在表格和筛选中，按正确 VAT 逻辑，调整 sale 优先级）
+const calculateProfit = (item) => {
+  const cur = currencyMap[item.country] || { symbol: "$", rate: 1 };
+  // ✅ 调整：优先 asinPrice（如果 >0），否则 salePrice
+  const sale = Number(item.asinPrice) > 0 ? Number(item.asinPrice) : Number(item.salePrice) || 0;
+  if (sale <= 0) return { netSale: 0, commissionFee: 0, totalCost: 0, gp: 0, rate: 0, vatFee: 0 };
+
+  // 实时成本 = purchaseCost * rate（换汇后）
+  const realTimeCost = (Number(item.purchaseCost) || 0) * cur.rate;
+  const first = Number(item.firstCost) || 0;
+  const last = Number(item.lastCost) || 0;
+  const adFee = ((Number(item.adCost) || 0) / 100) * sale;
+  const storageFee = ((Number(item.storageCost) || 0) / 100) * sale;
+  const returnFee = ((Number(item.returnCost) || 0) / 100) * sale;
+
+  // VAT：税款金额 = sale * vatRate（显示用）
+  const vatRate = VAT_RATE_MAP[item.country] || 0;
+  const vatFee = sale * vatRate;
+
+  // 净售价 = sale * (1 - vatRate)（实际收入）
+  const netSale = sale * (1 - vatRate);
+
+  // 佣金 = sale * COMMISSION_RATE（基于含 VAT 售价）
+  const commissionFee = sale * COMMISSION_RATE;
+
+  // 总成本（不含 VAT 和佣金）
+  const totalCost = realTimeCost + first + last + adFee + storageFee + returnFee;
+
+  // 毛利 = 净售价 - 佣金 - 总成本
+  const gp = netSale - commissionFee - totalCost;
+
+  // 毛利率 = gp / netSale（基于净售价）
+  const rate = netSale > 0 ? gp / netSale : 0;
+
+  return { netSale, commissionFee, totalCost, gp, rate, vatFee, sale }; // 返回 sale 用于显示
+};
+
 export default function ProductProfilePage() {
   // 数据 & 选择
   const [list, setList] = useState([]);
@@ -718,7 +755,7 @@ export default function ProductProfilePage() {
     }
   };
 
-  // 过滤 + 毛利率筛选 + 分页
+  // 过滤 + 毛利率筛选 + 分页（使用 calculateProfit 的新 rate）
   const filteredList = list
     .filter((item) => (filterCountry ? item.country === filterCountry : true))
     .filter((item) => (filterCategory ? item.category === filterCategory : true))
@@ -730,40 +767,7 @@ export default function ProductProfilePage() {
     .filter((item) => {
       if (!profitFilter) return true;
 
-      const cur = currencyMap[item.country] || { symbol: "$", rate: 1 };
-      const rawSale =
-        item.asinPrice != null && item.asinPrice !== ""
-          ? item.asinPrice
-          : item.salePrice;
-      const sale = Number(rawSale) || 0;
-      if (sale <= 0) return false;
-
-      // 实时成本 = purchaseCost * rate
-      const realTimeCost = (Number(item.purchaseCost) || 0) * cur.rate;
-      const first = Number(item.firstCost) || 0;
-      const last = Number(item.lastCost) || 0;
-      const adFee = ((Number(item.adCost) || 0) / 100) * sale;
-      const storageFee = ((Number(item.storageCost) || 0) / 100) * sale;
-      const returnFee = ((Number(item.returnCost) || 0) / 100) * sale;
-      const commissionFee = sale * COMMISSION_RATE;
-
-      // ✅ VAT：默认税率 * 售价
-      const vatRate = VAT_RATE_MAP[item.country] || 0;
-      const vatFee = sale * vatRate;
-
-      // ✅ total 使用实时成本
-      const total =
-        realTimeCost +
-        first +
-        last +
-        adFee +
-        storageFee +
-        returnFee +
-        commissionFee +
-        vatFee;
-
-      const gp = sale - total;
-      const rate = gp / sale;
+      const { rate } = calculateProfit(item); // 使用新计算
 
       if (profitFilter === "high") return rate > 0.3;
       if (profitFilter === "mid") return rate > 0.15;
@@ -867,7 +871,7 @@ export default function ProductProfilePage() {
           className="border px-3 py-2 rounded w-48"
         />
 
-        {/* 毛利率筛选 */}
+        {/* 毛利率筛选（基于新计算） */}
         <select
           value={profitFilter}
           onChange={(e) => setProfitFilter(e.target.value)}
@@ -881,7 +885,7 @@ export default function ProductProfilePage() {
         </select>
       </div>
 
-      {/* 表格 */}
+      {/* 表格（✅ 去除“计算售价”列，调整列顺序） */}
       <div className="overflow-auto bg-white rounded-lg shadow">
         <table className="min-w-full text-sm table-auto">
           <thead className="bg-gray-100 text-gray-700">
@@ -898,7 +902,8 @@ export default function ProductProfilePage() {
               <th className="border px-4 py-1 text-left">类目</th>
               <th className="border px-4 py-1 text-left">ASIN</th>
               <th className="border px-4 py-1 text-left">实时</th>
-              <th className="border px-4 py-1 text-left">计算售价</th>
+              {/* ✅ 新增：净售价列（紧跟实时后） */}
+              <th className="border px-4 py-1 text-left">净售价</th>
               <th className="border px-4 py-1 text-left">采购RMB</th>
               <th className="border px-4 py-1 text-left">换汇</th>
               <th className="border px-4 py-1 text-left">头程</th>
@@ -906,8 +911,8 @@ export default function ProductProfilePage() {
               <th className="border px-4 py-1 text-left">广告%</th>
               <th className="border px-4 py-1 text-left">仓储%</th>
               <th className="border px-4 py-1 text-left">退款%</th>
-              {/* ✅ VAT 列 */}
-              <th className="border px-4 py-1 text-left">增值</th>
+              {/* ✅ VAT 列：显示税款，不计入成本 */}
+              <th className="border px-4 py-1 text-left">增值税</th>
               <th className="border px-4 py-1 text-left">佣金</th>
               <th className="border px-4 py-1 text-left">毛利</th>
               <th className="border px-4 py-1 text-left">毛利率</th>
@@ -922,44 +927,10 @@ export default function ProductProfilePage() {
                 rate: 1,
               };
 
-              const rawSale =
-                item.asinPrice != null && item.asinPrice !== ""
-                  ? item.asinPrice
-                  : item.salePrice;
-              const sale = Number(rawSale) || 0;
+              // ✅ 使用新计算函数
+              const { netSale, commissionFee, gp, rate, vatFee, sale } = calculateProfit(item);
 
-              // 实时成本 = purchaseCost * rate
-              const realTimeCost = (Number(item.purchaseCost) || 0) * cur.rate;
-              const first = Number(item.firstCost) || 0;
-              const last = Number(item.lastCost) || 0;
-
-              const adFee = ((Number(item.adCost) || 0) / 100) * sale;
-              const storageFee =
-                ((Number(item.storageCost) || 0) / 100) * sale;
-              const returnFee =
-                ((Number(item.returnCost) || 0) / 100) * sale;
-
-              const commissionFee = sale * COMMISSION_RATE;
-
-              // ✅ VAT：默认税率 * 售价（英国20%、德国19%、其他0）
-              const vatRate = VAT_RATE_MAP[item.country] || 0;
-              const vatFee = sale * vatRate;
-
-              // ✅ total 使用实时成本
-              const total =
-                realTimeCost +
-                first +
-                last +
-                adFee +
-                storageFee +
-                returnFee +
-                commissionFee +
-                vatFee;
-
-              const gp = sale - total;
-              const rate = sale > 0 ? gp / sale : 0;
-              const rateDisplay =
-                sale > 0 ? (rate * 100).toFixed(1) + "%" : "-";
+              const rateDisplay = netSale > 0 ? (rate * 100).toFixed(1) + "%" : "-";
 
               const isSelected = selectedRows.some((r) => r.id === item.id);
 
@@ -1001,23 +972,17 @@ export default function ProductProfilePage() {
                     display={item.asinValue}
                   />
 
-                  {/* 实时价格可编辑 */}
+                  {/* 实时价格可编辑（asinPrice，直接用于计算） */}
                   <EditableCell
                     item={item}
                     field="asinPrice"
                     display={item.asinPrice ? `${cur.symbol}${item.asinPrice}` : "-"}
                   />
 
-                  {/* 用于利润计算的售价（实时优先） */}
-                  <EditableCell
-                    item={item}
-                    field="salePrice"
-                    display={
-                      rawSale != null && rawSale !== ""
-                        ? `${cur.symbol}${rawSale}`
-                        : `- ${cur.symbol}`
-                    }
-                  />
+                  {/* ✅ 新增：净售价显示 */}
+                  <td className="border px-3 py-1">
+                    {netSale > 0 ? `${cur.symbol}${netSale.toFixed(2)}` : "-"}
+                  </td>
 
                   <EditableCell
                     item={item}
@@ -1025,9 +990,9 @@ export default function ProductProfilePage() {
                     display={item.purchaseCost ? `¥${item.purchaseCost}` : "-"}
                   />
 
-                  {/* 新增：实时成本列 */}
+                  {/* 实时成本列 */}
                   <td className="border px-3 py-1">
-                    {item.purchaseCost ? `${cur.symbol}${realTimeCost.toFixed(2)}` : "-"}
+                    {item.purchaseCost ? `${cur.symbol}${(Number(item.purchaseCost) * cur.rate).toFixed(2)}` : "-"}
                   </td>
 
                   <EditableCell
@@ -1060,7 +1025,7 @@ export default function ProductProfilePage() {
                     display={item.returnCost ? `${item.returnCost}%` : "-"}
                   />
 
-                  {/* ✅ VAT 显示列 */}
+                  {/* ✅ VAT 显示：税款金额 */}
                   <td className="border px-3 py-1 text-red-700">
                     {vatFee > 0 ? `${cur.symbol}${vatFee.toFixed(2)}` : "-"}
                   </td>
@@ -1157,7 +1122,7 @@ export default function ProductProfilePage() {
         </button>
       </div>
 
-      {/* 新增 / 编辑 / 复制 拟态框 */}
+      {/* 新增 / 编辑 / 复制 拟态框（保留 salePrice 输入作为备选） */}
       {showModal && (
         <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50">
           <div className="bg-white rounded-2xl p-6 w-full max-w-4xl shadow-xl">
@@ -1297,12 +1262,13 @@ export default function ProductProfilePage() {
               </div>
 
               <div>
-                <label>售价（{currencyMap[form.country]?.symbol || '$'}）</label>
+                <label>售价（{currencyMap[form.country]?.symbol || '$'}，备选）</label>
                 <input
                   name="salePrice"
                   value={form.salePrice}
                   onChange={handleChange}
                   className="w-full border rounded px-3 py-2"
+                  placeholder="若无实时价格，使用此值"
                 />
               </div>
 
