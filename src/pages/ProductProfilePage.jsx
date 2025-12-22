@@ -39,6 +39,7 @@ const reservedKeys = ["objectId", "createdAt", "updatedAt", "ACL", "id"];
 
 const defaultForm = {
   sku: "",
+  productName: "", // ✅ 新增：品名
   country: "美国",
   category: "party",
   asinValue: "",
@@ -482,11 +483,12 @@ export default function ProductProfilePage() {
 
             const mapping = {
               SKU: "sku",
+              品名: "productName", // ✅ 新增：品名
               国家: "country",
               类目: "category",
               ASIN: "asinValue",
               售价USD: "salePrice",
-              采购RMB: "purchaseCost",
+              采购: "purchaseCost", // ✅ 修改列名映射
               长cm: "lengthCm",
               宽cm: "widthCm",
               高cm: "heightCm",
@@ -495,9 +497,9 @@ export default function ProductProfilePage() {
               运费方式: "freightType",
               头程USD: "firstCost",
               尾程USD: "lastCost",
-              广告: "adCost",
-              仓储: "storageCost",
-              退款: "returnCost",
+              广告: "adCost", // ✅ 修改列名映射
+              仓储: "storageCost", // ✅ 修改列名映射
+              退款: "returnCost", // ✅ 修改列名映射
               退货: "returnCost", // 兼容旧模板
             };
 
@@ -571,11 +573,12 @@ export default function ProductProfilePage() {
     const data = [
       {
         SKU: "",
+        品名: "", // ✅ 新增：品名
         国家: "美国",
         类目: "party",
         ASIN: "",
         售价USD: "",
-        采购RMB: "",
+        采购: "", // ✅ 修改列名
         长cm: "",
         宽cm: "",
         高cm: "",
@@ -584,9 +587,9 @@ export default function ProductProfilePage() {
         运费方式: "kg",
         头程USD: "",
         尾程USD: "",
-        广告: "",
-        仓储: "",
-        退款: "",
+        广告: "", // ✅ 修改列名
+        仓储: "", // ✅ 修改列名
+        退款: "", // ✅ 修改列名
       },
     ];
 
@@ -663,6 +666,7 @@ export default function ProductProfilePage() {
 
       obj.set("templateName", templateName.trim());
       obj.set("sku", templateSourceItem.sku);
+      obj.set("productName", templateSourceItem.productName); // ✅ 新增：品名
       obj.set("country", templateSourceItem.country);
       obj.set("category", templateSourceItem.category);
       obj.set("asinValue", templateSourceItem.asinValue);
@@ -698,6 +702,7 @@ export default function ProductProfilePage() {
       );
 
       const fields = [
+        "productName", // ✅ 新增：品名
         "country",
         "category",
         "asinValue",
@@ -865,6 +870,7 @@ export default function ProductProfilePage() {
           <option value="party">party</option>
           <option value="sport">sport</option>
           <option value="craft">craft</option>
+          <option value="toys">Toys</option> {/* ✅ 新增 Toys 选项 */}
         </select>
 
         {/* SKU 搜索 */}
@@ -903,19 +909,21 @@ export default function ProductProfilePage() {
                 />
               </th>
               <th className="border px-4 py-1 text-left">SKU</th>
+              {/* ✅ 修改：品名列 */}
+              <th className="border px-4 py-1 text-left">品名</th>
               <th className="border px-4 py-1 text-left">国家</th>
               <th className="border px-4 py-1 text-left">类目</th>
               <th className="border px-4 py-1 text-left">ASIN</th>
               <th className="border px-4 py-1 text-left">实时</th>
               {/* ✅ 新增：净售价列（紧跟实时后） */}
-              <th className="border px-4 py-1 text-left">净售价</th>
-              <th className="border px-4 py-1 text-left">采购RMB</th>
+              <th className="border px-4 py-1 text-left">净价</th> {/* ✅ 修改列名 */}
+              <th className="border px-4 py-1 text-left">采购</th> {/* ✅ 修改列名 */}
               <th className="border px-4 py-1 text-left">换汇</th>
               <th className="border px-4 py-1 text-left">头程</th>
               <th className="border px-4 py-1 text-left">尾程</th>
-              <th className="border px-4 py-1 text-left">广告%</th>
-              <th className="border px-4 py-1 text-left">仓储%</th>
-              <th className="border px-4 py-1 text-left">退款%</th>
+              <th className="border px-4 py-1 text-left">广告</th> {/* ✅ 修改列名 */}
+              <th className="border px-4 py-1 text-left">仓储</th> {/* ✅ 修改列名 */}
+              <th className="border px-4 py-1 text-left">退款</th> {/* ✅ 修改列名 */}
               {/* ✅ VAT 列：显示税款，不计入成本 */}
               <th className="border px-4 py-1 text-left">增值税</th>
               <th className="border px-4 py-1 text-left">佣金</th>
@@ -958,6 +966,22 @@ export default function ProductProfilePage() {
 
                   {/* SKU：点击打开模板列表 */}
                   <EditableCell item={item} field="sku" display={item.sku} />
+
+                  {/* ✅ 修改：品名列，不允许行内编辑，hover 显示全部，默认显示12字符，无省略号 */}
+                  <td className="border px-3 py-1 text-xs relative">
+                    {item.productName ? (
+                      <span
+                        className="cursor-default" // 移除 cursor-pointer
+                        title={item.productName} // hover 显示全部
+                      >
+                        {item.productName.length > 12
+                          ? item.productName.slice(0, 12)
+                          : item.productName}
+                      </span>
+                    ) : (
+                      "-"
+                    )}
+                  </td>
 
                   <EditableCell
                     item={item}
@@ -1149,6 +1173,18 @@ export default function ProductProfilePage() {
                 {isCopy && <p className="text-xs text-red-500 mt-1">复制时必须修改 SKU 为唯一值</p>}
               </div>
 
+              {/* ✅ 修改：品名输入 */}
+              <div>
+                <label>品名</label>
+                <input
+                  className="w-full border rounded px-3 py-2"
+                  name="productName"
+                  value={form.productName}
+                  onChange={handleChange}
+                  placeholder="产品名称"
+                />
+              </div>
+
               <div>
                 <label>国家</label>
                 <select
@@ -1176,6 +1212,7 @@ export default function ProductProfilePage() {
                   <option value="party">party</option>
                   <option value="sport">sport</option>
                   <option value="craft">craft</option>
+                  <option value="toys">Toys</option> {/* ✅ 新增 Toys 选项 */}
                 </select>
               </div>
 
