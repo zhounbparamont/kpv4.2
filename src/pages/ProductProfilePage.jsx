@@ -2,13 +2,19 @@ import React, { useEffect, useState } from "react";
 import AV from "../leancloud";
 import * as XLSX from "xlsx";
 
-// 汇率表（人民币 -> 站点货币）
+// 汇率表（人民币 -> 站点货币），使用2025-12-19实时汇率
 const currencyMap = {
-  美国: { code: "USD", rate: 0.14, domain: "www.amazon.com" },
-  英国: { code: "GBP", rate: 0.11, domain: "www.amazon.co.uk" },
-  德国: { code: "EUR", rate: 0.13, domain: "www.amazon.de" },
-  加拿大: { code: "CAD", rate: 0.19, domain: "www.amazon.ca" },
-  澳洲: { code: "AUD", rate: 0.21, domain: "www.amazon.com.au" },
+  美国: { code: "USD", symbol: "$", rate: 0.1420, domain: "www.amazon.com" },
+  英国: { code: "GBP", symbol: "£", rate: 0.1061, domain: "www.amazon.co.uk" },
+  德国: { code: "EUR", symbol: "€", rate: 0.1209, domain: "www.amazon.de" },
+  加拿大: { code: "CAD", symbol: "C$", rate: 0.196, domain: "www.amazon.ca" },
+  澳洲: { code: "AUD", symbol: "A$", rate: 0.215, domain: "www.amazon.com.au" },
+};
+
+// ✅ VAT 默认税率：英国 20%，德国 19%，其他 0%
+const VAT_RATE_MAP = {
+  英国: 0.2,
+  德国: 0.19,
 };
 
 const COMMISSION_RATE = 0.15;
@@ -19,8 +25,8 @@ const numericFields = [
   "lengthCm",
   "widthCm",
   "heightCm",
-  "weightKg",
-  "freightPrice",
+  "grossWeightKg",
+  "freightUnitPriceRmb",
   "firstCost",
   "lastCost",
   "adCost",
@@ -29,10 +35,11 @@ const numericFields = [
   "asinPrice",
 ];
 
-const reservedKeys = ["objectId", "createdAt", "updatedAt", "ACL"];
+const reservedKeys = ["objectId", "createdAt", "updatedAt", "ACL", "id"];
 
 const defaultForm = {
   sku: "",
+  productName: "", // ✅ 新增：品名
   country: "美国",
   category: "party",
   asinValue: "",
@@ -41,8 +48,8 @@ const defaultForm = {
   lengthCm: "",
   widthCm: "",
   heightCm: "",
-  weightKg: "",
-  freightPrice: "",
+  grossWeightKg: "",
+  freightUnitPriceRmb: "",
   freightType: "kg", // kg/cbm
   firstCost: "",
   lastCost: "",
@@ -51,16 +58,113 @@ const defaultForm = {
   returnCost: "",
 };
 
+// ✅ 数字清洗兜底：允许用户输入 "1kg" / "10RMB" 也能保存成纯数字
+const toNumberSafe = (v, field = "") => {
+  if (v === "" || v === null || v === undefined) return null;
+  const cleaned = String(v).replace(/[^\d.]/g, "");
+  if (cleaned === "") return null;
+  const n = Number(cleaned);
+  if (!Number.isFinite(n)) {
+    console.warn(`Invalid numeric value for ${field}: "${v}" -> null`);
+    return null;
+  }
+  return n;
+};
+
+// ✅ 预保存验证：检查数值字段
+const validateNumericFields = (obj) => {
+  const issues = [];
+  numericFields.forEach((field) => {
+    const val = obj.get(field);
+    if (val !== null && val !== undefined && typeof val !== "number") {
+      issues.push(field);
+    }
+  });
+  if (issues.length > 0) {
+    console.warn("Pre-save validation: Non-numeric values detected:", issues);
+  }
+  return issues.length === 0;
+};
+
+// ✅ 通用保存函数：带 schema 错误检测和字段解析
+const safeSave = async (obj, errorContext = "Save operation") => {
+  // Pre-validate numerics
+  if (!validateNumericFields(obj)) {
+    alert(`${errorContext} 警告：检测到非数字值，请检查输入（如 grossWeightKg）。`);
+    return false;
+  }
+
+  try {
+    await obj.save();
+    return true;
+  } catch (err) {
+    console.error(`${errorContext} failed:`, err);
+    let fieldHint = "";
+    if (err.message.includes("Invalid value type for field")) {
+      // Parse field name from error (e.g., extract 'grossWeightKg')
+      const fieldMatch = err.message.match(/for field '([^']+)'/);
+      const field = fieldMatch ? fieldMatch[1] : "unknown field";
+      fieldHint = `（请在 LeanCloud 控制台将 ${field} 类型改为 Number）`;
+    }
+    alert(`${errorContext} 失败：字段类型不匹配${fieldHint}。详情：${err.message}`);
+    return false;
+  }
+};
+
+// ✅ 利润计算函数（复用在表格和筛选中，按正确 VAT 逻辑，调整 sale 优先级）
+const calculateProfit = (item) => {
+  const cur = currencyMap[item.country] || { symbol: "$", rate: 1 };
+  // ✅ 调整：优先 asinPrice（如果 >0），否则 salePrice
+  const sale = Number(item.asinPrice) > 0 ? Number(item.asinPrice) : Number(item.salePrice) || 0;
+  if (sale <= 0) return { netSale: 0, commissionFee: 0, totalCost: 0, gp: 0, rate: 0, vatFee: 0 };
+
+  // 实时成本 = purchaseCost * rate（换汇后）
+  const realTimeCost = (Number(item.purchaseCost) || 0) * cur.rate;
+  const first = Number(item.firstCost) || 0;
+  const last = Number(item.lastCost) || 0;
+
+  // VAT：税款金额 = netSale * vatRate（显示用）
+  const vatRate = VAT_RATE_MAP[item.country] || 0;
+  let netSale;
+  if (vatRate > 0) {
+    netSale = sale / (1 + vatRate);
+  } else {
+    netSale = sale;
+  }
+  const vatFee = sale - netSale;
+
+  // 佣金 = sale * COMMISSION_RATE（基于含 VAT 售价）
+  const commissionFee = sale * COMMISSION_RATE;
+
+  // 广告/仓储/退款：基于净售价
+  const adFee = ((Number(item.adCost) || 0) / 100) * netSale;
+  const storageFee = ((Number(item.storageCost) || 0) / 100) * netSale;
+  const returnFee = ((Number(item.returnCost) || 0) / 100) * netSale;
+
+  // 总成本（不含 VAT 和佣金）
+  const totalCost = realTimeCost + first + last + adFee + storageFee + returnFee;
+
+  // 毛利 = 净售价 - 佣金 - 总成本
+  const gp = netSale - commissionFee - totalCost;
+
+  // 毛利率 = gp / netSale（基于净售价）
+  const rate = netSale > 0 ? gp / netSale : 0;
+
+  return { netSale, commissionFee, totalCost, gp, rate, vatFee, sale }; // 返回 sale 用于显示
+};
+
 export default function ProductProfilePage() {
   // 数据 & 选择
   const [list, setList] = useState([]);
   const [selectedRows, setSelectedRows] = useState([]);
   const [selectAll, setSelectAll] = useState(false);
 
-  // 新增/编辑 拟态框
+  // 新增/编辑/复制 拟态框
   const [showModal, setShowModal] = useState(false);
   const [isEdit, setIsEdit] = useState(false);
+  const [isCopy, setIsCopy] = useState(false);
   const [currentId, setCurrentId] = useState(null);
+  const [originalSku, setOriginalSku] = useState(null);
   const [form, setForm] = useState(defaultForm);
 
   // 行内编辑
@@ -108,7 +212,7 @@ export default function ProductProfilePage() {
       q.limit(1000);
       q.ascending("sku");
       const res = await q.find();
-      const data = res.map((x) => ({ id: x.id, ...x.toJSON() }));
+      const data = res.map((x) => ({ ...x.toJSON(), id: x.id }));
       setList(data);
       setSelectedRows([]);
       setSelectAll(false);
@@ -125,7 +229,9 @@ export default function ProductProfilePage() {
   const openCreate = () => {
     setForm(defaultForm);
     setIsEdit(false);
+    setIsCopy(false);
     setCurrentId(null);
+    setOriginalSku(null);
     setShowModal(true);
   };
 
@@ -137,7 +243,24 @@ export default function ProductProfilePage() {
       asinValue,
     });
     setIsEdit(true);
+    setIsCopy(false);
     setCurrentId(item.id);
+    setOriginalSku(null);
+    setShowModal(true);
+  };
+
+  const openCopy = (item) => {
+    const asinValue = (item.asinValue || "").toUpperCase();
+    setForm({
+      ...defaultForm,
+      ...item,
+      sku: "", // 清空 SKU，让用户必须输入新 SKU
+      asinValue,
+    });
+    setIsEdit(false);
+    setIsCopy(true);
+    setCurrentId(null);
+    setOriginalSku(item.sku);
     setShowModal(true);
   };
 
@@ -153,15 +276,17 @@ export default function ProductProfilePage() {
       if (value === "" || value == null) {
         obj.set(field, null);
       } else if (numericFields.includes(field)) {
-        obj.set(field, Number(value));
+        obj.set(field, toNumberSafe(value, field));
       } else {
         obj.set(field, String(value));
       }
 
-      await obj.save();
-      await fetchData();
+      const success = await safeSave(obj, `Inline edit for ${field}`);
+      if (success) {
+        await fetchData();
+      }
     } catch (err) {
-      alert("保存失败：" + err.message);
+      // Fallback (safeSave already alerts)
     } finally {
       setEditingCell({ id: null, field: null });
     }
@@ -266,9 +391,10 @@ export default function ProductProfilePage() {
       obj.set("asinPrice", price);
       obj.set("asinCurrency", "USD");
       obj.set("asinUpdatedAt", new Date());
-      await obj.save();
-      return true;
+      const success = await safeSave(obj, `Fetch price for ASIN ${asin}`);
+      return success;
     } catch (err) {
+      console.error("抓取价格失败:", err);
       return false;
     }
   }
@@ -357,22 +483,23 @@ export default function ProductProfilePage() {
 
             const mapping = {
               SKU: "sku",
+              品名: "productName", // ✅ 新增：品名
               国家: "country",
               类目: "category",
               ASIN: "asinValue",
               售价USD: "salePrice",
-              采购RMB: "purchaseCost",
+              采购: "purchaseCost", // ✅ 修改列名映射
               长cm: "lengthCm",
               宽cm: "widthCm",
               高cm: "heightCm",
-              毛重kg: "weightKg",
-              运费单价RMB: "freightPrice",
+              毛重kg: "grossWeightKg",
+              运费单价RMB: "freightUnitPriceRmb",
               运费方式: "freightType",
               头程USD: "firstCost",
               尾程USD: "lastCost",
-              广告: "adCost",
-              仓储: "storageCost",
-              退款: "returnCost",
+              广告: "adCost", // ✅ 修改列名映射
+              仓储: "storageCost", // ✅ 修改列名映射
+              退款: "returnCost", // ✅ 修改列名映射
               退货: "returnCost", // 兼容旧模板
             };
 
@@ -394,8 +521,8 @@ export default function ProductProfilePage() {
                   "lengthCm",
                   "widthCm",
                   "heightCm",
-                  "weightKg",
-                  "freightPrice",
+                  "grossWeightKg",
+                  "freightUnitPriceRmb",
                   "firstCost",
                   "lastCost",
                   "adCost",
@@ -403,14 +530,20 @@ export default function ProductProfilePage() {
                   "returnCost",
                 ].includes(dbKey)
               ) {
-                obj.set(dbKey, Number(val));
+                // ✅ 导入也做兜底清洗
+                obj.set(dbKey, toNumberSafe(val, dbKey));
               } else {
                 obj.set(dbKey, String(val));
               }
             }
 
-            await obj.save();
-            success++;
+            const saveSuccess = await safeSave(obj, `Import row for SKU ${row.SKU || "(unknown)"}`);
+            if (saveSuccess) {
+              success++;
+            } else {
+              fail++;
+              failRows.push(row.SKU || "(未知 SKU)");
+            }
           } catch (err) {
             fail++;
             failRows.push(row.SKU || "(未知 SKU)");
@@ -440,11 +573,12 @@ export default function ProductProfilePage() {
     const data = [
       {
         SKU: "",
+        品名: "", // ✅ 新增：品名
         国家: "美国",
         类目: "party",
         ASIN: "",
         售价USD: "",
-        采购RMB: "",
+        采购: "", // ✅ 修改列名
         长cm: "",
         宽cm: "",
         高cm: "",
@@ -453,9 +587,9 @@ export default function ProductProfilePage() {
         运费方式: "kg",
         头程USD: "",
         尾程USD: "",
-        广告: "",
-        仓储: "",
-        退款: "",
+        广告: "", // ✅ 修改列名
+        仓储: "", // ✅ 修改列名
+        退款: "", // ✅ 修改列名
       },
     ];
 
@@ -467,8 +601,8 @@ export default function ProductProfilePage() {
 
   // 运费 → 头程自动换算
   useEffect(() => {
-    const price = Number(form.freightPrice) || 0;
-    const weight = Number(form.weightKg) || 0;
+    const price = Number(form.freightUnitPriceRmb) || 0;
+    const weight = Number(form.grossWeightKg) || 0;
     const len = Number(form.lengthCm) || 0;
     const wid = Number(form.widthCm) || 0;
     const hei = Number(form.heightCm) || 0;
@@ -494,9 +628,9 @@ export default function ProductProfilePage() {
       firstCost: fixed,
     }));
   }, [
-    form.freightPrice,
+    form.freightUnitPriceRmb,
     form.freightType,
-    form.weightKg,
+    form.grossWeightKg,
     form.lengthCm,
     form.widthCm,
     form.heightCm,
@@ -532,6 +666,7 @@ export default function ProductProfilePage() {
 
       obj.set("templateName", templateName.trim());
       obj.set("sku", templateSourceItem.sku);
+      obj.set("productName", templateSourceItem.productName); // ✅ 新增：品名
       obj.set("country", templateSourceItem.country);
       obj.set("category", templateSourceItem.category);
       obj.set("asinValue", templateSourceItem.asinValue);
@@ -540,8 +675,8 @@ export default function ProductProfilePage() {
       obj.set("lengthCm", templateSourceItem.lengthCm);
       obj.set("widthCm", templateSourceItem.widthCm);
       obj.set("heightCm", templateSourceItem.heightCm);
-      obj.set("weightKg", templateSourceItem.weightKg);
-      obj.set("freightPrice", templateSourceItem.freightPrice);
+      obj.set("grossWeightKg", templateSourceItem.grossWeightKg);
+      obj.set("freightUnitPriceRmb", templateSourceItem.freightUnitPriceRmb);
       obj.set("freightType", templateSourceItem.freightType);
       obj.set("firstCost", templateSourceItem.firstCost);
       obj.set("lastCost", templateSourceItem.lastCost);
@@ -567,6 +702,7 @@ export default function ProductProfilePage() {
       );
 
       const fields = [
+        "productName", // ✅ 新增：品名
         "country",
         "category",
         "asinValue",
@@ -575,8 +711,8 @@ export default function ProductProfilePage() {
         "lengthCm",
         "widthCm",
         "heightCm",
-        "weightKg",
-        "freightPrice",
+        "grossWeightKg",
+        "freightUnitPriceRmb",
         "freightType",
         "firstCost",
         "lastCost",
@@ -586,15 +722,23 @@ export default function ProductProfilePage() {
       ];
 
       fields.forEach((key) => {
-        obj.set(key, tpl[key] ?? null);
+        let val = tpl[key];
+        if (numericFields.includes(key)) {
+          val = toNumberSafe(val, key); // Ensure numeric
+        } else if (key === "asinValue") {
+          val = (val || "").toUpperCase();
+        }
+        obj.set(key, val ?? null);
       });
 
-      await obj.save();
-      alert("已应用模板！");
-      setShowTemplateList(false);
-      fetchData();
+      const success = await safeSave(obj, `Apply template to SKU ${templateApplyItem.sku}`);
+      if (success) {
+        alert("已应用模板！");
+        setShowTemplateList(false);
+        fetchData();
+      }
     } catch (err) {
-      alert("应用模板失败：" + err.message);
+      // Fallback (safeSave already handles)
     }
   };
 
@@ -620,48 +764,20 @@ export default function ProductProfilePage() {
       alert("删除失败：" + err.message);
     }
   };
-  // 过滤 + 毛利率筛选 + 分页
+
+  // 过滤 + 毛利率筛选 + 分页（使用 calculateProfit 的新 rate）
   const filteredList = list
     .filter((item) => (filterCountry ? item.country === filterCountry : true))
     .filter((item) => (filterCategory ? item.category === filterCategory : true))
     .filter((item) =>
       searchSku
-        ? (item.sku || "")
-            .toLowerCase()
-            .includes(searchSku.toLowerCase())
+        ? (item.sku || "").toLowerCase().includes(searchSku.toLowerCase())
         : true
     )
     .filter((item) => {
       if (!profitFilter) return true;
 
-      const cur = currencyMap[item.country] || { code: "USD", rate: 1 };
-      const rawSale =
-        item.asinPrice != null && item.asinPrice !== ""
-          ? item.asinPrice
-          : item.salePrice;
-      const sale = Number(rawSale) || 0;
-      if (sale <= 0) return false;
-
-      const purchaseSite =
-        (Number(item.purchaseCost) || 0) * (cur.rate || 1);
-      const first = Number(item.firstCost) || 0;
-      const last = Number(item.lastCost) || 0;
-      const adFee = ((Number(item.adCost) || 0) / 100) * sale;
-      const storageFee = ((Number(item.storageCost) || 0) / 100) * sale;
-      const returnFee = ((Number(item.returnCost) || 0) / 100) * sale;
-      const commissionFee = sale * COMMISSION_RATE;
-
-      const total =
-        purchaseSite +
-        first +
-        last +
-        adFee +
-        storageFee +
-        returnFee +
-        commissionFee;
-
-      const gp = sale - total;
-      const rate = gp / sale;
+      const { rate } = calculateProfit(item); // 使用新计算
 
       if (profitFilter === "high") return rate > 0.3;
       if (profitFilter === "mid") return rate > 0.15;
@@ -744,7 +860,7 @@ export default function ProductProfilePage() {
           ))}
         </select>
 
-        {/* 类目筛选 */}
+        {/* 类目筛选（craft 已存在） */}
         <select
           value={filterCategory}
           onChange={(e) => setFilterCategory(e.target.value)}
@@ -754,6 +870,7 @@ export default function ProductProfilePage() {
           <option value="party">party</option>
           <option value="sport">sport</option>
           <option value="craft">craft</option>
+          <option value="toys">Toys</option> {/* ✅ 新增 Toys 选项 */}
         </select>
 
         {/* SKU 搜索 */}
@@ -765,7 +882,7 @@ export default function ProductProfilePage() {
           className="border px-3 py-2 rounded w-48"
         />
 
-        {/* 毛利率筛选 */}
+        {/* 毛利率筛选（基于新计算） */}
         <select
           value={profitFilter}
           onChange={(e) => setProfitFilter(e.target.value)}
@@ -779,7 +896,7 @@ export default function ProductProfilePage() {
         </select>
       </div>
 
-      {/* 表格 */}
+      {/* 表格（✅ 去除“计算售价”列，调整列顺序） */}
       <div className="overflow-auto bg-white rounded-lg shadow">
         <table className="min-w-full text-sm table-auto">
           <thead className="bg-gray-100 text-gray-700">
@@ -792,19 +909,25 @@ export default function ProductProfilePage() {
                 />
               </th>
               <th className="border px-4 py-1 text-left">SKU</th>
+              {/* ✅ 修改：品名列 */}
+              <th className="border px-4 py-1 text-left">品名</th>
               <th className="border px-4 py-1 text-left">国家</th>
               <th className="border px-4 py-1 text-left">类目</th>
               <th className="border px-4 py-1 text-left">ASIN</th>
-              <th className="border px-4 py-1 text-left">实时价格</th>
-              <th className="border px-4 py-1 text-left">用于计算的售价</th>
-              <th className="border px-4 py-1 text-left">采购(RMB)</th>
+              <th className="border px-4 py-1 text-left">实时</th>
+              {/* ✅ 新增：净售价列（紧跟实时后） */}
+              <th className="border px-4 py-1 text-left">净价</th> {/* ✅ 修改列名 */}
+              <th className="border px-4 py-1 text-left">采购</th> {/* ✅ 修改列名 */}
+              <th className="border px-4 py-1 text-left">换汇</th>
               <th className="border px-4 py-1 text-left">头程</th>
               <th className="border px-4 py-1 text-left">尾程</th>
-              <th className="border px-4 py-1 text-left">广告(%)</th>
-              <th className="border px-4 py-1 text-left">仓储(%)</th>
-              <th className="border px-4 py-1 text-left">退款(%)</th>
-              <th className="border px-4 py-1 text-left">平台佣金</th>
-              <th className="border px-4 py-1 text-left">毛利润</th>
+              <th className="border px-4 py-1 text-left">广告</th> {/* ✅ 修改列名 */}
+              <th className="border px-4 py-1 text-left">仓储</th> {/* ✅ 修改列名 */}
+              <th className="border px-4 py-1 text-left">退款</th> {/* ✅ 修改列名 */}
+              {/* ✅ VAT 列：显示税款，不计入成本 */}
+              <th className="border px-4 py-1 text-left">增值税</th>
+              <th className="border px-4 py-1 text-left">佣金</th>
+              <th className="border px-4 py-1 text-left">毛利</th>
               <th className="border px-4 py-1 text-left">毛利率</th>
               <th className="border px-4 py-1 text-left">操作</th>
             </tr>
@@ -813,42 +936,14 @@ export default function ProductProfilePage() {
           <tbody>
             {displayList.map((item) => {
               const cur = currencyMap[item.country] || {
-                code: "USD",
+                symbol: "$",
                 rate: 1,
               };
 
-              const rawSale =
-                item.asinPrice != null && item.asinPrice !== ""
-                  ? item.asinPrice
-                  : item.salePrice;
-              const sale = Number(rawSale) || 0;
+              // ✅ 使用新计算函数
+              const { netSale, commissionFee, gp, rate, vatFee, sale } = calculateProfit(item);
 
-              const purchaseSite =
-                (Number(item.purchaseCost) || 0) * (cur.rate || 1);
-              const first = Number(item.firstCost) || 0;
-              const last = Number(item.lastCost) || 0;
-
-              const adFee = ((Number(item.adCost) || 0) / 100) * sale;
-              const storageFee =
-                ((Number(item.storageCost) || 0) / 100) * sale;
-              const returnFee =
-                ((Number(item.returnCost) || 0) / 100) * sale;
-
-              const commissionFee = sale * COMMISSION_RATE;
-
-              const total =
-                purchaseSite +
-                first +
-                last +
-                adFee +
-                storageFee +
-                returnFee +
-                commissionFee;
-
-              const gp = sale - total;
-              const rate = sale > 0 ? gp / sale : 0;
-              const rateDisplay =
-                sale > 0 ? (rate * 100).toFixed(1) + "%" : "-";
+              const rateDisplay = netSale > 0 ? (rate * 100).toFixed(1) + "%" : "-";
 
               const isSelected = selectedRows.some((r) => r.id === item.id);
 
@@ -872,6 +967,22 @@ export default function ProductProfilePage() {
                   {/* SKU：点击打开模板列表 */}
                   <EditableCell item={item} field="sku" display={item.sku} />
 
+                  {/* ✅ 修改：品名列，不允许行内编辑，hover 显示全部，默认显示12字符，无省略号 */}
+                  <td className="border px-3 py-1 text-xs relative">
+                    {item.productName ? (
+                      <span
+                        className="cursor-default" // 移除 cursor-pointer
+                        title={item.productName} // hover 显示全部
+                      >
+                        {item.productName.length > 12
+                          ? item.productName.slice(0, 12)
+                          : item.productName}
+                      </span>
+                    ) : (
+                      "-"
+                    )}
+                  </td>
+
                   <EditableCell
                     item={item}
                     field="country"
@@ -890,40 +1001,39 @@ export default function ProductProfilePage() {
                     display={item.asinValue}
                   />
 
-                  {/* 实时价格可编辑 */}
+                  {/* 实时价格可编辑（asinPrice，直接用于计算） */}
                   <EditableCell
                     item={item}
                     field="asinPrice"
-                    display={item.asinPrice ? `$${item.asinPrice}` : "-"}
+                    display={item.asinPrice ? `${cur.symbol}${item.asinPrice}` : "-"}
                   />
 
-                  {/* 用于利润计算的售价（实时优先） */}
-                  <EditableCell
-                    item={item}
-                    field="salePrice"
-                    display={
-                      rawSale != null && rawSale !== ""
-                        ? `${rawSale} ${cur.code}`
-                        : `- ${cur.code}`
-                    }
-                  />
+                  {/* ✅ 新增：净售价显示 */}
+                  <td className="border px-3 py-1">
+                    {netSale > 0 ? `${cur.symbol}${netSale.toFixed(2)}` : "-"}
+                  </td>
 
                   <EditableCell
                     item={item}
                     field="purchaseCost"
-                    display={item.purchaseCost}
+                    display={item.purchaseCost ? `¥${item.purchaseCost}` : "-"}
                   />
+
+                  {/* 实时成本列 */}
+                  <td className="border px-3 py-1">
+                    {item.purchaseCost ? `${cur.symbol}${(Number(item.purchaseCost) * cur.rate).toFixed(2)}` : "-"}
+                  </td>
 
                   <EditableCell
                     item={item}
                     field="firstCost"
-                    display={item.firstCost ? `$${item.firstCost}` : "-"}
+                    display={item.firstCost ? `${cur.symbol}${item.firstCost}` : `- ${cur.symbol}`}
                   />
 
                   <EditableCell
                     item={item}
                     field="lastCost"
-                    display={item.lastCost ? `$${item.lastCost}` : "-"}
+                    display={item.lastCost ? `${cur.symbol}${item.lastCost}` : `- ${cur.symbol}`}
                   />
 
                   <EditableCell
@@ -944,12 +1054,17 @@ export default function ProductProfilePage() {
                     display={item.returnCost ? `${item.returnCost}%` : "-"}
                   />
 
+                  {/* ✅ VAT 显示：税款金额 */}
+                  <td className="border px-3 py-1 text-red-700">
+                    {vatFee > 0 ? `${cur.symbol}${vatFee.toFixed(2)}` : "-"}
+                  </td>
+
                   <td className="border px-3 py-1 text-orange-700">
-                    {commissionFee.toFixed(2)} {cur.code}
+                    {commissionFee.toFixed(2)} {cur.symbol}
                   </td>
 
                   <td className="border px-3 py-1 text-green-700">
-                    {gp.toFixed(2)} {cur.code}
+                    {cur.symbol}{gp.toFixed(2)}
                   </td>
 
                   <td className="border px-3 py-1 text-green-700">
@@ -1001,6 +1116,12 @@ export default function ProductProfilePage() {
                     >
                       删除
                     </button>
+                    <button
+                      onClick={() => openCopy(item)}
+                      className="text-indigo-600 hover:underline text-xs px-1"
+                    >
+                      复制
+                    </button>
                   </td>
                 </tr>
               );
@@ -1010,7 +1131,7 @@ export default function ProductProfilePage() {
       </div>
 
       {/* 分页 */}
-      <div className="flex justify中心 items-center gap-3 mt-4 text-sm">
+      <div className="flex justify-center items-center gap-3 mt-4 text-sm">
         <button
           disabled={currentPage === 1}
           onClick={() => setPage((p) => Math.max(1, p - 1))}
@@ -1029,23 +1150,38 @@ export default function ProductProfilePage() {
           下一页
         </button>
       </div>
-      {/* 新增 / 编辑 拟态框 */}
+
+      {/* 新增 / 编辑 / 复制 拟态框（保留 salePrice 输入作为备选） */}
       {showModal && (
         <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50">
           <div className="bg-white rounded-2xl p-6 w-full max-w-4xl shadow-xl">
             <h2 className="text-xl font-bold mb-5">
-              {isEdit ? "编辑产品档案" : "新增产品档案"}
+              {isEdit ? "编辑产品档案" : isCopy ? "复制产品档案" : "新增产品档案"}
             </h2>
 
             <div className="grid grid-cols-2 gap-6 text-sm">
               <div>
-                <label>SKU</label>
+                <label>SKU {isCopy && <span className="text-red-500">*</span>}</label>
                 <input
                   className="w-full border rounded px-3 py-2"
                   name="sku"
                   value={form.sku}
                   onChange={handleChange}
-                  disabled={isEdit} // 编辑时锁死
+                  disabled={isEdit} // 编辑时锁死，复制时允许修改
+                  placeholder={isCopy ? "必须修改 SKU" : ""}
+                />
+                {isCopy && <p className="text-xs text-red-500 mt-1">复制时必须修改 SKU 为唯一值</p>}
+              </div>
+
+              {/* ✅ 修改：品名输入 */}
+              <div>
+                <label>品名</label>
+                <input
+                  className="w-full border rounded px-3 py-2"
+                  name="productName"
+                  value={form.productName}
+                  onChange={handleChange}
+                  placeholder="产品名称"
                 />
               </div>
 
@@ -1076,6 +1212,7 @@ export default function ProductProfilePage() {
                   <option value="party">party</option>
                   <option value="sport">sport</option>
                   <option value="craft">craft</option>
+                  <option value="toys">Toys</option> {/* ✅ 新增 Toys 选项 */}
                 </select>
               </div>
 
@@ -1122,11 +1259,14 @@ export default function ProductProfilePage() {
 
                   <div className="flex items-center gap-2">
                     <span>毛重(kg)</span>
+                    {/* ✅ BUG 修复：只能输入数字 */}
                     <input
-                      name="weightKg"
-                      value={form.weightKg}
+                      type="number"
+                      step="0.001"
+                      name="grossWeightKg"
+                      value={form.grossWeightKg}
                       onChange={handleChange}
-                      placeholder="kg"
+                      placeholder="请输入数字"
                       className="w-24 border rounded px-3 py-2"
                     />
                   </div>
@@ -1135,13 +1275,16 @@ export default function ProductProfilePage() {
 
               {/* 运费配置 */}
               <div className="col-span-2">
-                <label>运费 (RMB)</label>
+                <label>运费 (¥)</label>
                 <div className="flex items-center gap-4 mt-1">
+                  {/* ✅ BUG 修复：只能输入数字 */}
                   <input
-                    name="freightPrice"
-                    value={form.freightPrice}
+                    type="number"
+                    step="0.01"
+                    name="freightUnitPriceRmb"
+                    value={form.freightUnitPriceRmb}
                     onChange={handleChange}
-                    placeholder="运费单价（RMB）"
+                    placeholder="运费单价（纯数字）"
                     className="w-40 border rounded px-3 py-2"
                   />
                   <span>/</span>
@@ -1155,23 +1298,24 @@ export default function ProductProfilePage() {
                     <option value="cbm">每立方米</option>
                   </select>
                   <span className="text-gray-500 text-xs">
-                    自动换算为 USD 填入下方“头程”
+                    自动换算为 {currencyMap[form.country]?.symbol || '$'} 填入下方“头程”
                   </span>
                 </div>
               </div>
 
               <div>
-                <label>售价（USD）</label>
+                <label>售价（{currencyMap[form.country]?.symbol || '$'}，备选）</label>
                 <input
                   name="salePrice"
                   value={form.salePrice}
                   onChange={handleChange}
                   className="w-full border rounded px-3 py-2"
+                  placeholder="若无实时价格，使用此值"
                 />
               </div>
 
               <div>
-                <label>采购成本（RMB）</label>
+                <label>采购成本（¥）</label>
                 <input
                   name="purchaseCost"
                   value={form.purchaseCost}
@@ -1181,7 +1325,7 @@ export default function ProductProfilePage() {
               </div>
 
               <div>
-                <label>头程（USD）</label>
+                <label>头程（{currencyMap[form.country]?.symbol || '$'}）</label>
                 <input
                   name="firstCost"
                   value={form.firstCost}
@@ -1191,7 +1335,7 @@ export default function ProductProfilePage() {
               </div>
 
               <div>
-                <label>尾程（USD）</label>
+                <label>尾程（{currencyMap[form.country]?.symbol || '$'}）</label>
                 <input
                   name="lastCost"
                   value={form.lastCost}
@@ -1234,7 +1378,11 @@ export default function ProductProfilePage() {
             {/* 底部按钮 */}
             <div className="flex justify-end gap-3 mt-6">
               <button
-                onClick={() => setShowModal(false)}
+                onClick={() => {
+                  setShowModal(false);
+                  setIsCopy(false);
+                  setOriginalSku(null);
+                }}
                 className="px-4 py-2 bg-gray-300 rounded hover:bg-gray-400"
               >
                 取消
@@ -1243,14 +1391,18 @@ export default function ProductProfilePage() {
               <button
                 onClick={async () => {
                   try {
+                    // 复制时额外检查 SKU 已修改
+                    if (isCopy && form.sku === originalSku) {
+                      alert("复制时必须修改 SKU 为唯一值！");
+                      return;
+                    }
+
                     // 同国家 SKU 不允许重复
                     const q = new AV.Query("ProductProfile");
                     q.equalTo("sku", form.sku);
                     q.equalTo("country", form.country);
                     const existed = await q.find();
-                    const conflict = existed.filter(
-                      (x) => x.id !== currentId
-                    );
+                    const conflict = existed.filter((x) => x.id !== currentId);
                     if (conflict.length > 0) {
                       alert("同一个国家下已存在相同 SKU，禁止重复！");
                       return;
@@ -1258,10 +1410,7 @@ export default function ProductProfilePage() {
 
                     const Model = AV.Object.extend("ProductProfile");
                     const obj = isEdit
-                      ? AV.Object.createWithoutData(
-                          "ProductProfile",
-                          currentId
-                        )
+                      ? AV.Object.createWithoutData("ProductProfile", currentId)
                       : new Model();
 
                     Object.keys(form).forEach((key) => {
@@ -1276,24 +1425,25 @@ export default function ProductProfilePage() {
                         value = (value || "").toUpperCase();
                       }
 
-                      if (
-                        value === "" ||
-                        value === null ||
-                        value === undefined
-                      ) {
+                      if (value === "" || value === null || value === undefined) {
                         obj.set(key, null);
                       } else if (numericFields.includes(key)) {
-                        obj.set(key, Number(value));
+                        // ✅ 兜底：即便有人粘贴了 "1kg"/"10RMB" 也能保存
+                        obj.set(key, toNumberSafe(value, key));
                       } else {
                         obj.set(key, String(value));
                       }
                     });
 
-                    await obj.save();
-                    setShowModal(false);
-                    await fetchData();
+                    const saveSuccess = await safeSave(obj, isEdit ? "Update product" : "Create product");
+                    if (saveSuccess) {
+                      setShowModal(false);
+                      setIsCopy(false);
+                      setOriginalSku(null);
+                      await fetchData();
+                    }
                   } catch (err) {
-                    alert("保存失败：" + err.message);
+                    // Fallback (safeSave already handles)
                   }
                 }}
                 className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700"
@@ -1386,7 +1536,7 @@ export default function ProductProfilePage() {
 
       {/* 抓取价格进度条 拟态框 */}
       {showProgress && (
-        <div className="fixed inset-0 bg黑 bg-opacity-40 flex items-center justify-center z-50">
+        <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-50">
           <div className="bg-white rounded-xl p-6 w-96 shadow-xl">
             <h2 className="text-lg font-bold mb-4">价格抓取中…</h2>
 
