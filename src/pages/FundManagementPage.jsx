@@ -42,9 +42,10 @@ export default function FundManagementPage() {
   const [modalForm, setModalForm] = useState({ site: "", type: "回款", amount: "", description: "", selectedPurchase: "" });
   const [paymentForm, setPaymentForm] = useState({ transactionId: "", actualAmount: "", paymentDate: "" });
   const [purchaseOrders, setPurchaseOrders] = useState([]); // 已采购订单列表
-  const [deductedPOs, setDeductedPOs] = useState(new Set()); // 已扣除的PO:SKU组合集合
+  const [deductedPOs, setDeductedPOs] = useState(new Set()); // 已扣除的PO:SKU组合集合（保留用于其他逻辑）
   const [error, setError] = useState("");
   const [isInitializing, setIsInitializing] = useState(true);
+  const [purchaseOrdersLoaded, setPurchaseOrdersLoaded] = useState(false); // 新增：跟踪采购订单加载状态
   const hasOperatedRef = useRef(false);
   const initializedRef = useRef(false); // 防止重复初始化
 
@@ -56,7 +57,7 @@ export default function FundManagementPage() {
     };
   }, []);
 
-  // 计算已扣除的PO:SKU组合
+  // 计算已扣除的PO:SKU组合（保留，用于其他 memo 等）
   useEffect(() => {
     const deducted = new Set();
     transactions.forEach(t => {
@@ -71,6 +72,8 @@ export default function FundManagementPage() {
     });
     setDeductedPOs(deducted);
   }, [transactions]);
+
+  // 移除：依赖 transactions 的 useEffect 调用 fetchPurchaseOrders（现在内部独立）
 
   // 计算每个站点的合同金额（非回款交易绝对值总和）
   const siteContractAmounts = useMemo(() => {
@@ -118,7 +121,7 @@ export default function FundManagementPage() {
       // 加载数据
       await fetchFunds();
       await fetchTransactions();
-      await fetchPurchaseOrders();
+      await fetchPurchaseOrders(); // 现在安全调用，因为内部独立过滤
     } catch (err) {
       console.error("自动初始化失败:", err);
       setError("自动初始化失败，请手动检查 LeanCloud 配置：" + err.message);
@@ -194,23 +197,67 @@ export default function FundManagementPage() {
     }
   };
 
-  // 新增：加载已采购订单
+  // 优化：加载已采购订单（内部独立查询扣除记录，避免竞态）
   const fetchPurchaseOrders = async () => {
     try {
+      // 第一步：查询所有 "采购扣除" 交易，构建已扣除描述 Set
+      const deductQuery = new AV.Query("FundTransaction");
+      deductQuery.equalTo("type", "采购扣除");
+      const deductRes = await deductQuery.find();
+      const deductedDescriptions = new Set();
+      const filteredExamples = []; // 用于日志的示例
+      deductRes.forEach(item => {
+        const desc = item.attributes.description;
+        if (desc && desc.startsWith("采购订单 ")) {
+          deductedDescriptions.add(desc);
+          // 提取 key 用于日志
+          const poMatch = desc.match(/采购订单 (.*?) \(/);
+          const skuMatch = desc.match(/\((.*?)\)/);
+          if (poMatch && skuMatch) {
+            filteredExamples.push(`${poMatch[1]} (${skuMatch[1]})`);
+          }
+        }
+      });
+
+      // 第二步：查询已采购订单
       const q = new AV.Query("PurchaseRequest");
       q.equalTo("status", "已采购");
       const res = await q.find();
-      const list = res.map(item => ({
+      const allOrders = res.map(item => ({
         id: item.id,
         ...item.attributes,
         country: item.attributes.country || "",
         poNumber: item.attributes.poNumber || "",
         orderAmount: item.attributes.orderAmount || 0,
         sku: item.attributes.sku || "",
-      })).filter(order => order.orderAmount > 0 && !deductedPOs.has(`${order.poNumber}:${order.sku}`));
+      })).filter(order => order.orderAmount > 0);
+
+      // 第三步：过滤已扣除订单
+      const list = allOrders.filter(order => {
+        const expectedDesc = `采购订单 ${order.poNumber} (${order.sku})`;
+        const isDeducted = deductedDescriptions.has(expectedDesc);
+        return !isDeducted;
+      });
+
+      // 日志：输出过滤详情
+      const filteredCount = allOrders.length - list.length;
+      console.log(`加载采购订单: ${list.length} 个（已过滤 ${filteredCount} 个已扣除订单）`);
+      if (filteredCount > 0) {
+        console.log("过滤示例:", filteredExamples.slice(0, 3)); // 只显示前3个，避免日志过多
+        // 具体检查用户订单
+        const userOrder = allOrders.find(o => o.poNumber === "PMPC25CBEC010074" && o.sku === "FGB007");
+        if (userOrder) {
+          const userExpectedDesc = `采购订单 PMPC25CBEC010074 (FGB007)`;
+          console.log(`用户订单检查: PO=PMPC25CBEC010074, SKU=FGB007, 预期描述="${userExpectedDesc}", 是否在扣除Set中: ${deductedDescriptions.has(userExpectedDesc)}`);
+        }
+      }
+
       setPurchaseOrders(list);
+      setPurchaseOrdersLoaded(true);
     } catch (err) {
       console.error("加载采购订单失败:", err);
+      setPurchaseOrders([]);
+      setPurchaseOrdersLoaded(true);
     }
   };
 
@@ -247,6 +294,10 @@ export default function FundManagementPage() {
     setModalForm({ site: "", type: "回款", amount: "", description: "", selectedPurchase: "" });
     setError("");
     setShowModal(true);
+    // 新增：如果采购订单未加载，提示或等待（但已初始化后加载）
+    if (!purchaseOrdersLoaded) {
+      console.warn("采购订单加载中，请稍候再选择...");
+    }
   };
 
   const closeModal = () => {
@@ -306,6 +357,8 @@ export default function FundManagementPage() {
       }));
 
       fetchTransactions(); // 刷新列表
+      // 新增：删除后刷新采购订单过滤
+      await fetchPurchaseOrders();
       alert("删除成功");
       hasOperatedRef.current = true;
     } catch (err) {
@@ -338,6 +391,7 @@ export default function FundManagementPage() {
   const handlePurchaseSelect = (e) => {
     const selectedId = e.target.value;
     const order = purchaseOrders.find(p => p.id === selectedId);
+    console.log(`选择采购订单: ${selectedId}, 订单详情:`, order);  // 调试日志
     if (order) {
       setModalForm(prev => ({
         ...prev,
@@ -414,6 +468,8 @@ export default function FundManagementPage() {
       alert(`${type}记录成功`);
       closeModal();
       fetchTransactions(); // 刷新交易列表
+      // 新增：保存后立即刷新采购订单过滤
+      await fetchPurchaseOrders();
       hasOperatedRef.current = true;
     } catch (err) {
       console.error("保存交易失败:", err);
@@ -504,6 +560,8 @@ export default function FundManagementPage() {
       }));
 
       fetchTransactions();
+      // 新增：扣除后刷新采购订单过滤
+      await fetchPurchaseOrders();
       hasOperatedRef.current = true;
     } catch (err) {
       console.error("扣除失败:", err);
@@ -758,14 +816,16 @@ export default function FundManagementPage() {
                   value={modalForm.selectedPurchase}
                   onChange={handlePurchaseSelect}
                   className="w-full border border-gray-300 rounded-md px-3 py-2 focus:ring-2 focus:ring-blue-500"
+                  disabled={!purchaseOrdersLoaded} // 新增：加载中禁用
                 >
-                  <option value="">手动输入或选择订单</option>
+                  <option value="">{purchaseOrdersLoaded ? "手动输入或选择订单" : "加载中..."}</option>
                   {purchaseOrders.map(order => (
                     <option key={order.id} value={order.id}>
                       {order.sku} - PO: {order.poNumber} - 站点: {order.country} - 金额: ¥{order.orderAmount.toFixed(2)}
                     </option>
                   ))}
                 </select>
+                {!purchaseOrdersLoaded && <p className="text-xs text-gray-500 mt-1">采购订单加载中，请稍候...</p>}
               </div>
               <div>
                 <label className="block font-medium text-gray-700 mb-1">站点（必填）</label>
