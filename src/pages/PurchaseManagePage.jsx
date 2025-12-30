@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from "react"; // 新增：useRef 用于记录操作状态
+import { useEffect, useState, useRef } from "react";
 import AV from "../leancloud";
 
 function StatusBadge({ status }) {
@@ -31,6 +31,47 @@ function CountryBadge({ country }) {
       return <span className={`${base} bg-gray-100 text-gray-800`}>国别: {country || '-'}</span>;
   }
 }
+
+// 新增：扣除资金函数（移植自 FundManagementPage 的 handlePurchaseDeduct）
+const deductFunds = async (site, poNumber, sku, amount) => {
+  if (amount <= 0) {
+    console.warn("扣除金额必须大于0，跳过");
+    return;
+  }
+  try {
+    const transaction = new AV.Object("FundTransaction");
+    transaction.set("site", site);
+    transaction.set("type", "采购扣除");
+    transaction.set("amount", -amount); // 负数表示扣除
+    transaction.set("description", `采购订单 ${poNumber} (${sku})`);
+    await transaction.save();
+    console.log(`创建交易记录: ${site} - 采购扣除 ¥${amount.toFixed(2)}`);
+
+    // 更新 SiteFund balance
+    const q = new AV.Query("SiteFund");
+    q.equalTo("site", site);
+    const existing = await q.first();
+    let newBalance;
+    if (existing) {
+      const currentBalance = existing.attributes.balance || 0;
+      newBalance = currentBalance - amount;
+      existing.set("balance", newBalance);
+      await existing.save();
+    } else {
+      // 创建新记录
+      const fundRecord = new AV.Object("SiteFund");
+      fundRecord.set("site", site);
+      fundRecord.set("balance", -amount);
+      fundRecord.set("actualPaid", 0);
+      await fundRecord.save();
+      newBalance = -amount;
+    }
+    console.log(`更新余额成功: ${site} 新余额 ¥${newBalance.toFixed(2)}`);
+  } catch (err) {
+    console.error("扣除资金失败:", err);
+    alert(`扣除资金失败: ${err.message}`);
+  }
+};
 
 export default function PurchaseManagePage() {
   const [allList, setAllList] = useState([]);
@@ -335,6 +376,10 @@ export default function PurchaseManagePage() {
         PurchaseRequest.set("orderAmount", orderAmount);
         PurchaseRequest.set("status", "已采购");
         await PurchaseRequest.save();
+
+        // 新增：自动扣除资金
+        await deductFunds(record.country, poNumber, record.sku, orderAmount);
+
       } else if (modalAction === "partialInbound") {
         // 分批入库（单个）
         const partialQty = parseInt(modalForm.partialInboundQuantity);
@@ -354,6 +399,8 @@ export default function PurchaseManagePage() {
         }
         PurchaseRequest.set("status", newStatus);
         await PurchaseRequest.save();
+        // 注意：入库不扣除资金（已在“已采购”时扣除）
+
       } else if (modalAction === "batchInput") {
         // 批量输入
         const poNumber = modalForm.poNumber.trim();
@@ -372,6 +419,11 @@ export default function PurchaseManagePage() {
           setError("选中的行总数量为0，无法分摊");
           return;
         }
+        // 检查站点是否一致（可选优化）
+        const countries = [...new Set(record.map(r => r.country))];
+        if (countries.length > 1) {
+          console.warn("批量订单跨多个站点，按站点逐个扣除");
+        }
         // 批量保存
         const savePromises = record.map(async (r) => {
           const PurchaseRequest = AV.Object.createWithoutData("PurchaseRequest", r.id);
@@ -381,6 +433,9 @@ export default function PurchaseManagePage() {
           PurchaseRequest.set("orderAmount", rowAmount);
           PurchaseRequest.set("status", "已采购");
           await PurchaseRequest.save();
+
+          // 新增：自动扣除资金（逐个订单）
+          await deductFunds(r.country, poNumber, r.sku, rowAmount);
         });
         await Promise.all(savePromises);
         clearSelection(); // 保存后清空选中
